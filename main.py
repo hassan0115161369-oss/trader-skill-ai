@@ -1,11 +1,12 @@
 import asyncio
 import json
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta
-import aiohttp
 import flet as ft
 import websockets
 
-# هوية Cyber Bull البصرية
+# الهوية البصرية Cyber Bull
 BG_DARK = "#050811"
 CARD_GLASS = "#0D152C"
 NEON_CYAN = "#00F5D4"
@@ -17,7 +18,12 @@ TEXT_MUTED = "#94A3B8"
 
 
 class AutoRiskShield:
-    def __init__(self, max_daily_loss: float = 50.0, daily_profit_target: float = 100.0, max_consecutive_losses: int = 3):
+    def __init__(
+        self,
+        max_daily_loss: float = 50.0,
+        daily_profit_target: float = 100.0,
+        max_consecutive_losses: int = 3,
+    ):
         self.max_daily_loss = max_daily_loss
         self.daily_profit_target = daily_profit_target
         self.max_consecutive_losses = max_consecutive_losses
@@ -29,13 +35,17 @@ class AutoRiskShield:
     def can_trade(self, account_type: str) -> tuple[bool, str]:
         if account_type == "REAL" and not self.allow_real_trading:
             return False, "قفل الأمان نشط: فعّل التداول الحقيقي يدوياً أولاً."
+
         if self.cooldown_until and datetime.now() < self.cooldown_until:
             mins = int((self.cooldown_until - datetime.now()).total_seconds() // 60) + 1
             return False, f"فترة تبريد تلقائية ({mins} دقيقة متبقية) بعد {self.max_consecutive_losses} خسائر متتالية."
+
         if self.daily_pnl <= -abs(self.max_daily_loss):
             return False, f"تم بلوغ حد الخسارة اليومي (-{self.max_daily_loss}$). تم إيقاف الروبوت."
+
         if self.daily_pnl >= self.daily_profit_target:
             return False, f"تم تحقيق هدف الربح اليومي (+{self.daily_profit_target}$)."
+
         return True, "OK"
 
     def record_result(self, pnl: float):
@@ -50,7 +60,14 @@ class AutoRiskShield:
 
 
 class MultiBrokerEngine:
-    def __init__(self, platform: str, token: str, app_id: str = "1089", bridge_url: str = "", account_id: str = ""):
+    def __init__(
+        self,
+        platform: str,
+        token: str,
+        app_id: str = "1089",
+        bridge_url: str = "",
+        account_id: str = "",
+    ):
         self.platform = platform
         self.token = token.strip()
         self.app_id = app_id.strip() or "1089"
@@ -68,9 +85,11 @@ class MultiBrokerEngine:
             self.ws = await websockets.connect(url, ping_interval=20)
             await self.ws.send(json.dumps({"authorize": self.token}))
             res = json.loads(await self.ws.recv())
+
             if "error" in res:
                 self.is_connected = False
                 return False, res["error"].get("message", "خطأ توثيق Deriv")
+
             auth = res["authorize"]
             self.account_id = auth.get("loginid", "UNKNOWN")
             self.balance = float(auth.get("balance", 0.0))
@@ -82,16 +101,19 @@ class MultiBrokerEngine:
         if self.platform == "MT5":
             if not self.bridge_url or not self.account_id:
                 return False, "أدخل رابط الجسر Bridge URL ورقم حساب MT5"
-            headers = {"Authorization": f"Bearer {self.token}"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.bridge_url}/account/{self.account_id}", headers=headers, timeout=10) as r:
-                    if r.status != 200:
-                        return False, f"فشل الاتصال بجسر MT5 (رمز {r.status})"
-                    data = await r.json()
+            try:
+                req = urllib.request.Request(
+                    f"{self.bridge_url}/account/{self.account_id}",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read().decode("utf-8"))
                     self.balance = float(data.get("balance", 0.0))
                     self.currency = data.get("currency", "USD")
                     self.is_connected = True
                     return True, f"متصل بـ MT5 ({self.account_id})"
+            except Exception as ex:
+                return False, f"فشل الاتصال بجسر MT5: {ex}"
 
         if self.platform == "Binance":
             if not self.token:
@@ -118,15 +140,26 @@ class MultiBrokerEngine:
             if "tick" in res:
                 return float(res["tick"]["quote"])
         elif self.platform == "MT5" and self.bridge_url and self.is_connected:
-            headers = {"Authorization": f"Bearer {self.token}"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{self.bridge_url}/price/{symbol}", headers=headers, timeout=8) as r:
-                    if r.status == 200:
-                        data = await r.json()
-                        return float(data.get("bid", 0.0))
+            try:
+                req = urllib.request.Request(
+                    f"{self.bridge_url}/price/{symbol}",
+                    headers={"Authorization": f"Bearer {self.token}"},
+                )
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                    return float(data.get("bid", 0.0))
+            except Exception:
+                return 0.0
         return 0.0
 
-    async def execute_order(self, symbol: str, side: str, amount: float, duration: int = 1, duration_unit: str = "m") -> dict:
+    async def execute_order(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        duration: int = 1,
+        duration_unit: str = "m",
+    ) -> dict:
         if self.platform == "Deriv" and self.ws and self.is_connected:
             contract_type = "CALL" if side.upper() == "BUY" else "PUT"
             req = {
@@ -149,19 +182,41 @@ class MultiBrokerEngine:
             buy = res.get("buy", {})
             if "balance_after" in buy:
                 self.balance = float(buy["balance_after"])
-            return {"ok": True, "msg": f"تم تنفيذ {contract_type} على {symbol} | العقد: {buy.get('contract_id')}"}
+            return {
+                "ok": True,
+                "msg": f"تم تنفيذ {contract_type} على {symbol} | العقد: {buy.get('contract_id')}",
+            }
 
         if self.platform == "MT5" and self.bridge_url and self.is_connected:
-            headers = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
-            payload = {"account_id": self.account_id, "symbol": symbol, "action": side.upper(), "volume": amount}
-            async with aiohttp.ClientSession() as session:
-                async with session.post(f"{self.bridge_url}/trade", json=payload, headers=headers, timeout=10) as r:
-                    data = await r.json()
-                    if r.status in (200, 201):
-                        return {"ok": True, "msg": f"تم إرسال أمر {side.upper()} على MT5 ({symbol})"}
-                    return {"ok": False, "msg": data.get("detail", "فشل أمر MT5")}
+            try:
+                payload = json.dumps({
+                    "account_id": self.account_id,
+                    "symbol": symbol,
+                    "action": side.upper(),
+                    "volume": amount,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    f"{self.bridge_url}/trade",
+                    data=payload,
+                    headers={
+                        "Authorization": f"Bearer {self.token}",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=10) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                    return {
+                        "ok": True,
+                        "msg": f"تم إرسال أمر {side.upper()} على MT5 ({symbol}) - {data.get('ticket', '')}",
+                    }
+            except Exception as ex:
+                return {"ok": False, "msg": f"فشل أمر MT5: {ex}"}
 
-        return {"ok": False, "msg": f"التنفيذ المباشر على {self.platform} يتطلب ربط نقطة النهاية أو التوكن النشط"}
+        return {
+            "ok": False,
+            "msg": f"التنفيذ المباشر على {self.platform} يتطلب ربط نقطة النهاية أو التوكن النشط",
+        }
 
     async def disconnect(self):
         if self.ws:
@@ -200,7 +255,9 @@ class TraderSkillAI:
                     line,
                     size=12,
                     font_family="monospace",
-                    color=DANGER_RED if "[ERR]" in line else (SUCCESS_GREEN if "[ORD]" in line else NEON_CYAN),
+                    color=DANGER_RED
+                    if "[ERR]" in line
+                    else (SUCCESS_GREEN if "[ORD]" in line else NEON_CYAN),
                 )
                 for line in self.logs
             ]
@@ -231,7 +288,11 @@ class TraderSkillAI:
                         ),
                         ft.Container(height=18),
                         ft.Text("TRADER SKILL AI", size=28, weight=ft.FontWeight.BOLD, color=TEXT_PRIMARY),
-                        ft.Text("AI FINANCIAL INTELLIGENCE & MULTI-BROKER AUTO BOT", size=12, color=NEON_CYAN),
+                        ft.Text(
+                            "AI FINANCIAL INTELLIGENCE & MULTI-BROKER AUTO BOT",
+                            size=12,
+                            color=NEON_CYAN,
+                        ),
                         ft.Container(height=28),
                         ft.ProgressBar(width=220, color=NEON_CYAN, bgcolor="#1E293B"),
                     ],
@@ -247,7 +308,11 @@ class TraderSkillAI:
 
     def show_login(self):
         self.page.clean()
-        email = ft.TextField(label="البريد الإلكتروني / Email", border_color=ELECTRIC_BLUE, focused_border_color=NEON_CYAN)
+        email = ft.TextField(
+            label="البريد الإلكتروني / Email",
+            border_color=ELECTRIC_BLUE,
+            focused_border_color=NEON_CYAN,
+        )
         password = ft.TextField(
             label="كلمة المرور / Password",
             password=True,
@@ -334,7 +399,12 @@ class TraderSkillAI:
             ],
             border_color=ELECTRIC_BLUE,
         )
-        token_tf = ft.TextField(label="API Token / Key", password=True, can_reveal_password=True, border_color=ELECTRIC_BLUE)
+        token_tf = ft.TextField(
+            label="API Token / Key",
+            password=True,
+            can_reveal_password=True,
+            border_color=ELECTRIC_BLUE,
+        )
         app_id_tf = ft.TextField(label="Deriv App ID (افتراضي 1089)", value="1089", border_color=ELECTRIC_BLUE)
         bridge_tf = ft.TextField(label="MT5 Bridge URL (اختياري لـ MT5)", border_color=ELECTRIC_BLUE)
         acc_id_tf = ft.TextField(label="Account ID (اختياري لـ MT5)", border_color=ELECTRIC_BLUE)
@@ -404,7 +474,13 @@ class TraderSkillAI:
             bgcolor=SUCCESS_GREEN,
             color=BG_DARK,
             height=46,
-            on_click=lambda e: self._toggle_bot(bot_btn, symbol_dd.value, stake_tf.value, max_loss_tf.value, target_tf.value),
+            on_click=lambda e: self._toggle_bot(
+                bot_btn,
+                symbol_dd.value,
+                stake_tf.value,
+                max_loss_tf.value,
+                target_tf.value,
+            ),
         )
 
         tabs = ft.Tabs(
@@ -428,7 +504,10 @@ class TraderSkillAI:
                                     bgcolor=CARD_GLASS,
                                     border=ft.border.all(1, ELECTRIC_BLUE),
                                     content=ft.Column([
-                                        ft.Row([ft.Text("الرصيد الفعلي للحساب", color=TEXT_MUTED), self.status_badge], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                                        ft.Row(
+                                            [ft.Text("الرصيد الفعلي للحساب", color=TEXT_MUTED), self.status_badge],
+                                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                                        ),
                                         self.balance_lbl,
                                     ]),
                                 ),
@@ -438,7 +517,12 @@ class TraderSkillAI:
                                     border_radius=16,
                                     bgcolor=CARD_GLASS,
                                     content=ft.Column([
-                                        ft.Text("إعدادات التداول الآلي وإدارة المخاطر", size=15, weight=ft.FontWeight.BOLD, color=NEON_CYAN),
+                                        ft.Text(
+                                            "إعدادات التداول الآلي وإدارة المخاطر",
+                                            size=15,
+                                            weight=ft.FontWeight.BOLD,
+                                            color=NEON_CYAN,
+                                        ),
                                         symbol_dd,
                                         ft.Row([stake_tf, real_switch], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                                         ft.Row([max_loss_tf, target_tf], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
@@ -453,7 +537,11 @@ class TraderSkillAI:
                                     bgcolor="#03060D",
                                     border=ft.border.all(1, "#1E293B"),
                                     content=ft.Column([
-                                        ft.Text("سجل العمليات والذكاء الاصطناعي (Live Log)", size=12, color=TEXT_MUTED),
+                                        ft.Text(
+                                            "سجل العمليات والذكاء الاصطناعي (Live Log)",
+                                            size=12,
+                                            color=TEXT_MUTED,
+                                        ),
                                         self.logs_column,
                                     ]),
                                 ),
@@ -469,14 +557,24 @@ class TraderSkillAI:
                         content=ft.Column(
                             scroll=ft.ScrollMode.AUTO,
                             controls=[
-                                ft.Text("ربط منصات التداول (Multi-Broker)", size=16, weight=ft.FontWeight.BOLD, color=NEON_CYAN),
+                                ft.Text(
+                                    "ربط منصات التداول (Multi-Broker)",
+                                    size=16,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=NEON_CYAN,
+                                ),
                                 platform_dd,
                                 token_tf,
                                 app_id_tf,
                                 bridge_tf,
                                 acc_id_tf,
                                 ft.Row([
-                                    ft.ElevatedButton("اتصال / CONNECT", bgcolor=ELECTRIC_BLUE, color=BG_DARK, on_click=do_connect),
+                                    ft.ElevatedButton(
+                                        "اتصال / CONNECT",
+                                        bgcolor=ELECTRIC_BLUE,
+                                        color=BG_DARK,
+                                        on_click=do_connect,
+                                    ),
                                     ft.OutlinedButton("فصل / DISCONNECT", on_click=do_disconnect),
                                 ]),
                             ],
@@ -491,11 +589,29 @@ class TraderSkillAI:
                         content=ft.Column(
                             scroll=ft.ScrollMode.AUTO,
                             controls=[
-                                ft.Text("مركز التحليل الفني والمؤشرات والأخبار", size=16, weight=ft.FontWeight.BOLD, color=NEON_CYAN),
-                                ft.Text("• الشموع اليابانية: Doji, Hammer, Engulfing, Pin Bar, Morning/Evening Star.", size=13),
-                                ft.Text("• المؤشرات الفنية: RSI, MACD, EMA, Bollinger Bands, ATR, VWAP.", size=13),
-                                ft.Text("• التقويم الاقتصادي والأخبار: فصل الحقائق عن التوقعات ومراقبة جودة البيانات LIVE/DELAYED.", size=13),
-                                ft.Text("• إعادة العرض التاريخي (Market Replay) وشبكة العلاقات الاقتصادية والأكاديمية التعليمية.", size=13, color=TEXT_MUTED),
+                                ft.Text(
+                                    "مركز التحليل الفني والمؤشرات والأخبار",
+                                    size=16,
+                                    weight=ft.FontWeight.BOLD,
+                                    color=NEON_CYAN,
+                                ),
+                                ft.Text(
+                                    "• الشموع اليابانية: Doji, Hammer, Engulfing, Pin Bar, Morning/Evening Star.",
+                                    size=13,
+                                ),
+                                ft.Text(
+                                    "• المؤشرات الفنية: RSI, MACD, EMA, Bollinger Bands, ATR, VWAP.",
+                                    size=13,
+                                ),
+                                ft.Text(
+                                    "• التقويم الاقتصادي والأخبار: فصل الحقائق عن التوقعات ومراقبة جودة البيانات LIVE/DELAYED.",
+                                    size=13,
+                                ),
+                                ft.Text(
+                                    "• إعادة العرض التاريخي (Market Replay) وشبكة العلاقات الاقتصادية والأكاديمية التعليمية.",
+                                    size=13,
+                                    color=TEXT_MUTED,
+                                ),
                             ],
                         ),
                     ),
@@ -506,13 +622,16 @@ class TraderSkillAI:
         top_bar = ft.Container(
             padding=ft.padding.symmetric(horizontal=14, vertical=10),
             bgcolor="#080D1E",
-            content=ft.Row([
-                ft.Row([ft.Icon(ft.Icons.BOLT, color=NEON_CYAN), ft.Text("TRADER SKILL AI", weight=ft.FontWeight.BOLD)]),
-                ft.Row([
-                    ft.IconButton(ft.Icons.LANGUAGE, on_click=self.switch_lang),
-                    ft.IconButton(ft.Icons.LOGOUT, on_click=lambda _: self.show_login()),
-                ]),
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+            content=ft.Row(
+                [
+                    ft.Row([ft.Icon(ft.Icons.BOLT, color=NEON_CYAN), ft.Text("TRADER SKILL AI", weight=ft.FontWeight.BOLD)]),
+                    ft.Row([
+                        ft.IconButton(ft.Icons.LANGUAGE, on_click=self.switch_lang),
+                        ft.IconButton(ft.Icons.LOGOUT, on_click=lambda _: self.show_login()),
+                    ]),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
         )
 
         self.page.add(ft.Column([top_bar, tabs], expand=True))
@@ -522,7 +641,14 @@ class TraderSkillAI:
         self.risk.allow_real_trading = enabled
         self.log("تم فتح قفل الحساب الحقيقي" if enabled else "تم قفل الحساب الحقيقي", "INFO")
 
-    def _toggle_bot(self, btn: ft.ElevatedButton, symbol: str, stake_s: str, max_loss_s: str, target_s: str):
+    def _toggle_bot(
+        self,
+        btn: ft.ElevatedButton,
+        symbol: str,
+        stake_s: str,
+        max_loss_s: str,
+        target_s: str,
+    ):
         if not self.broker or not self.broker.is_connected:
             self.log("اربط حسابك أولاً من تبويب المنصات", "ERR")
             return
