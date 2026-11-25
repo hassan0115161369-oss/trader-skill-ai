@@ -1,0 +1,4 @@
+flet==0.24.1
+websockets>=12.0
+aiohttp>=3.9.5
+cryptography>=42.0.0
